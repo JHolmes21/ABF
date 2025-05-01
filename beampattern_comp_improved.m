@@ -1,8 +1,8 @@
 
-% Improved Beampattern Comparison: MVDR, SMI, DL-SMI, LMS
+% Final Clean Beampattern Comparison: MVDR, SMI, DL-SMI, LMS
 clear; clc;
 
-% Parameters
+% Array and signal parameters
 N = 10;
 d = 0.5;
 theta = -90:0.1:90;
@@ -20,25 +20,21 @@ j = sqrt(10^(INR_dB/10)) * (randn(1,snapshots) + 1j*randn(1,snapshots)) / sqrt(2
 noise = (randn(N,snapshots) + 1j*randn(N,snapshots)) / sqrt(2);
 X = a(theta0) * s + a(theta_jam) * j + noise;
 
-% Normalize input power
-X = X ./ sqrt(mean(abs(X(:)).^2));
+% Sample covariance matrices
+R_hat = (X * X') / snapshots;
+alpha = 0.1;
+R_loaded = R_hat + alpha * eye(N);
+R_true = cov(X.');
 
-% Covariance estimates
-R_true = cov(X.');                 % Ideal covariance
-R_hat = (X * X') / snapshots;      % Sample covariance
-alpha = 0.01;
-R_loaded = R_hat + alpha * eye(N); % Diagonal loaded
-
-% Steering vector (normalized)
+% Desired steering vector (not normalized)
 a_d = a(theta0);
-a_d = a_d / norm(a_d);
 
 % Beamforming weights
 w_mvdr = (R_true \ a_d) / (a_d' * (R_true \ a_d));
 w_smi  = (R_hat  \ a_d) / (a_d' * (R_hat  \ a_d));
 w_dl   = (R_loaded \ a_d) / (a_d' * (R_loaded \ a_d));
 
-% LMS weights
+% LMS parameters
 mu = 0.01;
 w_lms = zeros(N,1);
 for n = 1:snapshots
@@ -47,26 +43,26 @@ for n = 1:snapshots
     w_lms = w_lms + mu * x_n * conj(e);
 end
 
-% Beampatterns
+% Compute beampatterns
 P_mvdr = zeros(size(theta));
 P_smi = zeros(size(theta));
 P_dl = zeros(size(theta));
 P_lms = zeros(size(theta));
 
 for idx = 1:length(theta)
-    a_theta = a(theta(idx));
-    a_theta = a_theta / norm(a_theta);
+    a_theta = a(theta(idx));  % No normalization
     P_mvdr(idx) = abs(w_mvdr' * a_theta).^2;
     P_smi(idx)  = abs(w_smi'  * a_theta).^2;
     P_dl(idx)   = abs(w_dl'   * a_theta).^2;
     P_lms(idx)  = abs(w_lms'  * a_theta).^2;
 end
 
-% Normalize and convert to dB
-P_mvdr = 10*log10(P_mvdr / max(P_mvdr));
-P_smi  = 10*log10(P_smi  / max(P_mvdr));
-P_dl   = 10*log10(P_dl   / max(P_mvdr));
-P_lms  = 10*log10(P_lms  / max(P_mvdr));
+% Avoid log of zero
+epsilon = 1e-12;
+P_mvdr = 10*log10(max(P_mvdr, epsilon) / max(P_mvdr));
+P_smi  = 10*log10(max(P_smi,  epsilon) / max(P_mvdr));
+P_dl   = 10*log10(max(P_dl,   epsilon) / max(P_mvdr));
+P_lms  = 10*log10(max(P_lms,  epsilon) / max(P_mvdr));
 
 % Plot
 figure;
@@ -77,6 +73,6 @@ plot(theta, P_lms, 'g:', 'LineWidth', 1.5);
 legend('MVDR (Ideal)', 'SMI', 'SMI + Diagonal Loading', 'LMS');
 xlabel('Angle (degrees)');
 ylabel('Normalized Power (dB)');
-title('Improved Beampattern Comparison');
+title('Final Beampattern Comparison');
 grid on;
 axis([-90 90 -60 0]);
