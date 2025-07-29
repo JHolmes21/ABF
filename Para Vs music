@@ -1,0 +1,86 @@
+% DOA Estimation using PARAFAC vs MUSIC
+
+clc; clear; close all;
+
+%% Parameters
+M = 8;              % Number of sensors
+R = 3;              % Number of sources
+T = 100;            % Number of time snapshots
+SNR = 20;           % Signal-to-noise ratio (dB)
+c = 3e8;            % Speed of light
+f = 1e9;            % Frequency (Hz)
+lambda = c / f;     % Wavelength
+d = lambda / 2;     % Element spacing
+angles = [-20, 0, 25]; % True DOAs (degrees)
+
+%% Generate ULA Steering Matrix
+A = zeros(M, R);
+for r = 1:R
+    theta = angles(r) * pi/180;
+    A(:,r) = exp(-1j*2*pi*d*(0:M-1)'*sin(theta)/lambda);
+end
+
+%% Generate Source Signals
+S = randn(R, T) + 1j*randn(R, T); % Complex Gaussian sources
+
+%% Received Signal
+X = A*S;
+
+% Add noise
+noise_power = norm(X,'fro')^2/(T*M*10^(SNR/10));
+N = sqrt(noise_power/2)*(randn(M,T)+1j*randn(M,T));
+Xn = X + N;
+
+%% MUSIC Algorithm
+Rxx = (Xn*Xn')/T;
+[U, D] = eig(Rxx);
+[~, idx] = sort(diag(D), 'descend');
+Un = U(:, idx(R+1:end)); % Noise subspace
+
+theta_scan = -90:0.1:90;
+Pmusic = zeros(size(theta_scan));
+
+for k = 1:length(theta_scan)
+    a = exp(-1j*2*pi*d*(0:M-1)'*sin(theta_scan(k)*pi/180)/lambda);
+    Pmusic(k) = 1 / (a'*Un*Un'*a);
+end
+
+Pmusic_dB = 10*log10(abs(Pmusic)/max(abs(Pmusic)));
+
+%% Tensor Formation for PARAFAC
+% Reshape data into tensor: M x 1 x T (rank-R model)
+X_tensor = zeros(M, 1, T);
+for t = 1:T
+    X_tensor(:,:,t) = Xn(:,t);
+end
+
+%% PARAFAC Decomposition (using Tensor Toolbox)
+addpath(genpath('tensor_toolbox'));
+X_tt = tensor(X_tensor);
+M_parafac = cp_als(X_tt, R, 'printitn', 0);
+
+A_est = M_parafac.U{1}; % Spatial factors
+
+%% Estimate DOAs from spatial factors
+% Match columns to steering vectors
+estimated_angles = zeros(1, R);
+for r = 1:R
+    corr_vals = zeros(size(theta_scan));
+    for k = 1:length(theta_scan)
+        a = exp(-1j*2*pi*d*(0:M-1)'*sin(theta_scan(k)*pi/180)/lambda);
+        corr_vals(k) = abs(a'*A_est(:,r));
+    end
+    [~, max_idx] = max(corr_vals);
+    estimated_angles(r) = theta_scan(max_idx);
+end
+
+%% Plot Results
+figure;
+plot(theta_scan, Pmusic_dB, 'LineWidth', 2); hold on;
+stem(angles, ones(size(angles))*-3, 'r', 'filled', 'DisplayName','True DOAs');
+stem(estimated_angles, ones(size(estimated_angles))*-6, 'g','filled', 'DisplayName','PARAFAC DOAs');
+ylabel('Spatial Spectrum (dB)');
+xlabel('Angle (degrees)');
+title('DOA Estimation: MUSIC vs PARAFAC');
+legend('MUSIC Spectrum', 'True DOAs', 'PARAFAC Estimated DOAs');
+grid on;
