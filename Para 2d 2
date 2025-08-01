@@ -1,0 +1,144 @@
+% 2D DOA Estimation using PARAFAC vs MUSIC (URA, improved ALS)
+
+clc; clear; close all;
+
+%% Parameters
+Mx = 4; My = 4;              % URA size (4x4)
+M = Mx * My;                 % Total sensors
+R = 3;                       % Number of sources
+T = 100;                     % Number of time snapshots
+SNR = 20;                    % Signal-to-noise ratio (dB)
+c = 3e8;                     % Speed of light
+f = 1e9;                     % Frequency (Hz)
+lambda = c / f;              % Wavelength
+d = lambda / 2;              % Element spacing
+
+% True azimuth and elevation angles (degrees)
+azimuths = [-30, 10, 35];     % Azimuth angles
+elevations = [20, 40, 60];    % Elevation angles
+
+%% Generate URA Steering Matrix
+A = zeros(M, R);
+[x_grid, y_grid] = meshgrid(0:Mx-1, 0:My-1);
+x_grid = x_grid(:); y_grid = y_grid(:);
+
+for r = 1:R
+    theta = elevations(r) * pi/180;
+    phi = azimuths(r) * pi/180;
+    a = exp(-1j*2*pi*d/lambda * (x_grid*sin(theta)*cos(phi) + y_grid*sin(theta)*sin(phi)));
+    A(:,r) = a;
+end
+
+%% Generate Source Signals
+S = randn(R, T) + 1j*randn(R, T); % Complex Gaussian sources
+
+%% Received Signal
+X = A*S;
+
+% Add noise
+noise_power = norm(X,'fro')^2/(T*M*10^(SNR/10));
+N = sqrt(noise_power/2)*(randn(M,T)+1j*randn(M,T));
+Xn = X + N;
+
+%% MUSIC Algorithm (2D grid search)
+az_grid = -90:1:90;
+el_grid = 0:1:90;
+Pmusic = zeros(length(el_grid), length(az_grid));
+
+Rxx = (Xn*Xn')/T;
+[U, D] = eig(Rxx);
+[~, idx] = sort(diag(D), 'descend');
+Un = U(:, idx(R+1:end)); % Noise subspace
+
+for ii = 1:length(el_grid)
+    for jj = 1:length(az_grid)
+        theta = el_grid(ii) * pi/180;
+        phi = az_grid(jj) * pi/180;
+        a = exp(-1j*2*pi*d/lambda * (x_grid*sin(theta)*cos(phi) + y_grid*sin(theta)*sin(phi)));
+        Pmusic(ii,jj) = 1 / (a'*Un*Un'*a);
+    end
+end
+
+Pmusic_dB = 10*log10(abs(Pmusic)/max(Pmusic(:)));
+
+%% Improved PARAFAC via ALS
+X_tensor = Xn; % M x T
+
+% Initialize using SVD
+[U0, ~, V0] = svd(X_tensor, 'econ');
+A_parafac = U0(:,1:R);
+C_parafac = V0(:,1:R);
+
+max_iter = 1000;
+tol = 1e-6;
+for iter = 1:max_iter
+    A_old = A_parafac;
+
+    % Fix C, update A
+    for m = 1:M
+        X_m = X_tensor(m,:).';
+        A_parafac(m,:) = (pinv(C_parafac) * X_m).';
+    end
+    A_parafac = A_parafac ./ vecnorm(A_parafac); % Normalize
+
+    % Fix A, update C
+    for t = 1:T
+        X_t = X_tensor(:,t);
+        C_parafac(t,:) = (pinv(A_parafac) * X_t).';
+    end
+    C_parafac = C_parafac ./ vecnorm(C_parafac); % Normalize
+
+    % Convergence check
+    if norm(A_parafac - A_old, 'fro') / norm(A_old, 'fro') < tol
+        break;
+    end
+end
+
+%% Estimate DOAs from A_parafac
+estimated_az = zeros(1, R);
+estimated_el = zeros(1, R);
+
+for r = 1:R
+    max_val = -inf;
+    for ii = 1:length(el_grid)
+        for jj = 1:length(az_grid)
+            theta = el_grid(ii) * pi/180;
+            phi = az_grid(jj) * pi/180;
+            a = exp(-1j*2*pi*d/lambda * (x_grid*sin(theta)*cos(phi) + y_grid*sin(theta)*sin(phi)));
+            corr = abs(a'*A_parafac(:,r));
+            if corr > max_val
+                max_val = corr;
+                estimated_el(r) = el_grid(ii);
+                estimated_az(r) = az_grid(jj);
+            end
+        end
+    end
+end
+
+%% Plot MUSIC Spectrum (2D Heatmap)
+figure;
+imagesc(az_grid, el_grid, Pmusic_dB);
+axis xy;
+xlabel('Azimuth (deg)'); ylabel('Elevation (deg)');
+title('MUSIC Spectrum (2D)');
+colorbar;
+hold on;
+scatter(azimuths, elevations, 100, 'r', 'filled', 'DisplayName','True DOAs');
+scatter(estimated_az, estimated_el, 100, 'g', 'filled', 'DisplayName','PARAFAC DOAs');
+legend;
+
+%% Separate Azimuth and Elevation plots
+figure;
+subplot(2,1,1);
+stem(azimuths, ones(1,R), 'r', 'filled'); hold on;
+stem(estimated_az, ones(1,R)*0.8, 'g','filled');
+ylim([0 1.2]); grid on;
+title('Azimuth DOA Estimates'); ylabel('Normalized');
+legend('True', 'PARAFAC');
+
+subplot(2,1,2);
+stem(elevations, ones(1,R), 'r', 'filled'); hold on;
+stem(estimated_el, ones(1,R)*0.8, 'g','filled');
+ylim([0 1.2]); grid on;
+title('Elevation DOA Estimates'); ylabel('Normalized');
+xlabel('Angle (degrees)'); legend('True', 'PARAFAC');
