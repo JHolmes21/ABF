@@ -1,0 +1,38 @@
+% STAP Mini Example: 2 antennas x 3 pulses (6D ST vector)
+
+clc; clear;
+
+%% 1. Steering Vector (Target Direction + Doppler)
+s = ones(6, 1);  % Steering vector (flat for simplicity)
+
+%% 2. Clutter-only Training Data (3 snapshots)
+x1 = [1; 0; 1; 0; 1; 0];
+x2 = [0; 1; 0; 1; 0; 1];
+x3 = [1; 1; 1; 1; 1; 1];  % Strong clutter aligned with s
+
+% Stack into training matrix
+X_train = [x1, x2, x3];
+
+%% 3. Compute Sample Covariance Matrix
+R = (1/3) * (x1 * x1' + x2 * x2' + x3 * x3');
+
+%% 4. Compute STAP Weights
+w = R \ s;                    % w = R^(-1) * s
+w = w / (s' * w);             % Normalize
+
+%% 5. Test Data Snapshot (Target + Clutter)
+target = 0.5 * s;             % Target amplitude = 0.5
+clutter = x3;                 % Clutter aligned with s
+x = target + clutter;         % Total received vector
+
+%% 6. STAP Output
+y = w' * x;                   % Filtered output
+
+%% 7. Display Results
+disp('--- STAP Example ---');
+disp('STAP Weights (w):'); disp(w);
+disp(['Output y = ', num2str(y)]);
+
+% Compare with unfiltered output (no STAP)
+y_unfiltered = s' * x / (s' * s);
+disp(['Unfiltered y = ', num2str(y_unfiltered)]);
