@@ -1,0 +1,85 @@
+clc; clear;
+
+%% PARAMETERS
+% Array structure
+subarray_rows = 3;
+subarray_cols = 3;
+elements_per_subarray = 4; % 1D ULA inside each subarray
+lambda = 1;                 % Wavelength
+d = lambda/2;               % Inter-element spacing
+
+% Derived total array size
+M_total = subarray_rows * subarray_cols * elements_per_subarray;
+
+% Signal properties
+S = 3;                      % Number of sources
+K = 20;                     % Number of snapshots
+N = 50;                     % Time samples per snapshot
+SNR_dB = 10;                % Signal-to-noise ratio
+
+% Source angles [azimuth; elevation]
+az = [-20, 0, 30];          % Degrees
+el = [10, 20, 45];          % Degrees
+
+% Time vector
+t = linspace(0, 1e-3, N);
+
+%% SIMULATE RECEIVED SIGNALS
+X = cell(K, 1);  % Data for parafac2
+
+% UPA element positions (flattened)
+[x_grid, y_grid] = meshgrid(0:subarray_cols-1, 0:subarray_rows-1);
+subarray_positions = [x_grid(:), y_grid(:)] * elements_per_subarray * d;
+
+% Each subarray is a 1D ULA along x-axis
+ula_positions = (0:elements_per_subarray-1).' * d;
+
+% Full array: 3x3 grid of ULAs (flattened)
+element_positions = [];
+for i = 1:size(subarray_positions,1)
+    base = subarray_positions(i, :);
+    pos = [base(1) + ula_positions, base(2) + zeros(size(ula_positions))];
+    element_positions = [element_positions; pos];
+end
+
+% Total number of elements
+M = size(element_positions,1);
+
+% Generate source signals and steering
+for k = 1:K
+    % Source signals: random phase per snapshot
+    S_k = exp(1j * 2 * pi * rand(S, N));
+
+    % Steering matrix A_k (M x S)
+    A_k = zeros(M, S);
+    for s = 1:S
+        az_rad = deg2rad(az(s));
+        el_rad = deg2rad(el(s));
+        k_vec = [cos(el_rad) * sin(az_rad);
+                 sin(el_rad)];  % Only x and y (2D UPA)
+        A_k(:, s) = exp(1j * 2 * pi / lambda * (element_positions * k_vec));
+    end
+
+    % Received signal
+    X_k = A_k * S_k;
+
+    % Add noise
+    noise = (randn(M, N) + 1j * randn(M, N)) / sqrt(2);
+    X_k = X_k + 10^(-SNR_dB/20) * noise;
+
+    X{k} = X_k;
+end
+
+%% APPLY PARAFAC2
+addpath('parafac2_toolbox_path'); % Change to your actual path
+F = S;  % Number of components to extract
+[Fac, ~] = parafac2(X, F);
+
+%% PLOT RESULTS
+figure;
+for f = 1:F
+    subplot(F,1,f);
+    plot(abs(Fac{2}(:,f)));
+    title(['Estimated Source ' num2str(f) ' Temporal Signature']);
+    xlabel('Time'); ylabel('Magnitude');
+end
