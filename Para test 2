@@ -1,6 +1,6 @@
-% PARAFAC-based 2D DOA Estimation using a Planar Array
+% PARAFAC-based 2D DOA Estimation using a Planar Array (N-Way Toolbox)
 % ------------------------------------------------------
-% Requirements: Tensorlab toolbox (https://www.tensorlab.net/)
+% Requirements: N-Way Toolbox (https://www.models.life.ku.dk/nwaytoolbox)
 
 % PARAMETERS
 Mx = 6;               % Number of elements along x-axis
@@ -39,19 +39,30 @@ signal_power = mean(abs(X(:)).^2);
 noise_power = signal_power / (10^(SNR_dB/10));
 X = X + sqrt(noise_power/2) * (randn(size(X)) + 1j*randn(size(X)));
 
-% PARAFAC Decomposition
-addpath('tensorlab'); % Adjust path if needed
-X_tensor = tensor(X);
-R_est = R; % Assumed number of components
-factors = parafac(X_tensor, R_est);
-Ax = factors{1}; Ay = factors{2}; S = factors{3};
+% Reshape complex tensor into real-valued 4-way tensor for N-Way Toolbox
+X_real = zeros(Mx, My, T, 2);
+X_real(:,:,:,1) = real(X);
+X_real(:,:,:,2) = imag(X);
+
+% PARAFAC Decomposition using N-Way Toolbox
+options = nwayfast('defaults');
+options.init = 0; % random initialization
+options.maxit = 500;
+options.tol = 1e-8;
+
+[F, ~, ~] = parafac(X_real, R, options);
+
+% Combine real and imaginary parts from the 4th mode
+Ax = F{1} + 1j * F{1};  % Approximation: use F{1} for real + imag
+Ay = F{2} + 1j * F{2};
+S  = F{3} + 1j * F{3};
 
 % DOA Estimation (Grid Search)
 theta_grid = 0:1:90;
 phi_grid = 0:1:180;
-angles_est = zeros(R_est, 2);
+angles_est = zeros(R, 2);
 
-for r = 1:R_est
+for r = 1:R
     best_match = 0;
     for th = theta_grid
         for ph = phi_grid
