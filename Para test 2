@@ -1,0 +1,79 @@
+% PARAFAC-based 2D DOA Estimation using a Planar Array
+% ------------------------------------------------------
+% Requirements: Tensorlab toolbox (https://www.tensorlab.net/)
+
+% PARAMETERS
+Mx = 6;               % Number of elements along x-axis
+My = 6;               % Number of elements along y-axis
+T = 200;              % Number of time snapshots
+R = 3;                % Number of sources
+lambda = 1;           % Wavelength
+d = lambda / 2;       % Inter-element spacing
+
+% Source DOAs (theta: elevation, phi: azimuth)
+theta_true = [30, 60, 45];
+phi_true = [20, 70, 150];
+
+% Initialize data tensor
+X = zeros(Mx, My, T);
+
+% Generate source signals and fill the tensor
+for r = 1:R
+    theta_rad = deg2rad(theta_true(r));
+    phi_rad = deg2rad(phi_true(r));
+    kx = sin(theta_rad) * cos(phi_rad);
+    ky = sin(theta_rad) * sin(phi_rad);
+
+    ax = exp(1j * 2 * pi * d * (0:Mx-1).' * kx);
+    ay = exp(1j * 2 * pi * d * (0:My-1).' * ky);
+    s = randn(1,T) + 1j * randn(1,T);  % complex source signal
+
+    for t = 1:T
+        X(:,:,t) = X(:,:,t) + ax * ay.' * s(t);
+    end
+end
+
+% Add complex Gaussian noise
+SNR_dB = 10;
+signal_power = mean(abs(X(:)).^2);
+noise_power = signal_power / (10^(SNR_dB/10));
+X = X + sqrt(noise_power/2) * (randn(size(X)) + 1j*randn(size(X)));
+
+% PARAFAC Decomposition
+addpath('tensorlab'); % Adjust path if needed
+X_tensor = tensor(X);
+R_est = R; % Assumed number of components
+factors = parafac(X_tensor, R_est);
+Ax = factors{1}; Ay = factors{2}; S = factors{3};
+
+% DOA Estimation (Grid Search)
+theta_grid = 0:1:90;
+phi_grid = 0:1:180;
+angles_est = zeros(R_est, 2);
+
+for r = 1:R_est
+    best_match = 0;
+    for th = theta_grid
+        for ph = phi_grid
+            th_rad = deg2rad(th); ph_rad = deg2rad(ph);
+            kx = sin(th_rad)*cos(ph_rad);
+            ky = sin(th_rad)*sin(ph_rad);
+
+            ax_ref = exp(1j*2*pi*d*(0:Mx-1)'*kx);
+            ay_ref = exp(1j*2*pi*d*(0:My-1)'*ky);
+
+            score = abs((Ax(:,r)'*ax_ref) * (Ay(:,r)'*ay_ref));
+            if score > best_match
+                best_match = score;
+                angles_est(r,:) = [th, ph];
+            end
+        end
+    end
+end
+
+% Display results
+fprintf('True DOAs (theta, phi):\n');
+disp([theta_true(:), phi_true(:)]);
+
+fprintf('Estimated DOAs (theta, phi):\n');
+disp(angles_est);
