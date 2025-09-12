@@ -1,0 +1,94 @@
+function [E, N] = wgs84_to_osgb36(lat, lon)
+    % Convert WGS84 latitude and longitude (in degrees) to OSGB36 Easting and Northing (in meters)
+    % Inputs:  lat, lon - latitude and longitude in degrees
+    % Outputs: E, N     - Easting and Northing in meters (OSGB36)
+
+    % WGS84 ellipsoid
+    a1 = 6378137.0;
+    b1 = 6356752.3141;
+    e2_1 = 1 - (b1^2 / a1^2);
+
+    % OSGB36 ellipsoid (Airy 1830)
+    a2 = 6377563.396;
+    b2 = 6356256.909;
+    e2_2 = 1 - (b2^2 / a2^2);
+
+    % Helmert transformation parameters (WGS84 to OSGB36)
+    tx = -446.448;
+    ty = 125.157;
+    tz = -542.060;
+    rx = -0.1502 * pi / (180 * 3600); % Convert arcseconds to radians
+    ry = -0.2470 * pi / (180 * 3600);
+    rz = -0.8421 * pi / (180 * 3600);
+    s = 20.4894e-6;
+
+    % Convert input lat/lon to radians
+    lat_rad = deg2rad(lat);
+    lon_rad = deg2rad(lon);
+
+    % Step 1: Convert geodetic WGS84 to ECEF Cartesian
+    nu1 = a1 / sqrt(1 - e2_1 * sin(lat_rad)^2);
+    x1 = nu1 * cos(lat_rad) * cos(lon_rad);
+    y1 = nu1 * cos(lat_rad) * sin(lon_rad);
+    z1 = (1 - e2_1) * nu1 * sin(lat_rad);
+
+    % Step 2: Apply Helmert transformation (WGS84 -> OSGB36)
+    x2 = tx + (1 + s) * (x1 + (-rz) * y1 + ry * z1);
+    y2 = ty + (1 + s) * (rz * x1 + y1 + (-rx) * z1);
+    z2 = tz + (1 + s) * ((-ry) * x1 + rx * y1 + z1);
+
+    % Step 3: Convert ECEF to OSGB36 geodetic coordinates
+    p = sqrt(x2^2 + y2^2);
+    lat0 = atan2(z2, p * (1 - e2_2));
+    lat2 = 0;
+    while abs(lat0 - lat2) > 1e-12
+        lat2 = lat0;
+        nu2 = a2 / sqrt(1 - e2_2 * sin(lat2)^2);
+        lat0 = atan2(z2 + e2_2 * nu2 * sin(lat2), p);
+    end
+    lon_osgb = atan2(y2, x2);
+    lat_osgb = lat0;
+
+    % Step 4: Project to OSGB36 Easting/Northing using Transverse Mercator
+    N0 = -100000;
+    E0 = 400000;
+    F0 = 0.9996012717;
+    phi0 = deg2rad(49);
+    lambda0 = deg2rad(-2);
+
+    n = (a2 - b2) / (a2 + b2);
+    nu = a2 * F0 / sqrt(1 - e2_2 * sin(lat_osgb)^2);
+    rho = a2 * F0 * (1 - e2_2) / (1 - e2_2 * sin(lat_osgb)^2)^1.5;
+    eta2 = nu / rho - 1;
+
+    M = meridional_arc(a2, b2, F0, lat_osgb, phi0);
+
+    I = M + N0;
+    II = (nu / 2) * sin(lat_osgb) * cos(lat_osgb);
+    III = (nu / 24) * sin(lat_osgb) * cos(lat_osgb)^3 * (5 - tan(lat_osgb)^2 + 9 * eta2);
+    IIIA = (nu / 720) * sin(lat_osgb) * cos(lat_osgb)^5 * (61 - 58 * tan(lat_osgb)^2 + tan(lat_osgb)^4);
+    IV = nu * cos(lat_osgb);
+    V = (nu / 6) * cos(lat_osgb)^3 * (nu / rho - tan(lat_osgb)^2);
+    VI = (nu / 120) * cos(lat_osgb)^5 * (5 - 18 * tan(lat_osgb)^2 + tan(lat_osgb)^4 + 14 * eta2 - 58 * tan(lat_osgb)^2 * eta2);
+
+    dLambda = lon_osgb - lambda0;
+
+    N = I + II * dLambda^2 + III * dLambda^4 + IIIA * dLambda^6;
+    E = E0 + IV * dLambda + V * dLambda^3 + VI * dLambda^5;
+end
+
+function M = meridional_arc(a, b, F0, phi, phi0)
+    % Meridional arc calculation (used in transverse Mercator projection)
+    n = (a - b) / (a + b);
+    n2 = n^2;
+    n3 = n^3;
+
+    delta_phi = phi - phi0;
+
+    Ma = (1 + n + (5/4)*n2 + (5/4)*n3) * delta_phi;
+    Mb = (3*n + 3*n^2 + (21/8)*n3) * sin(delta_phi) * cos(phi + phi0);
+    Mc = ((15/8)*n2 + (15/8)*n3) * sin(2*delta_phi) * cos(2*(phi + phi0));
+    Md = (35/24)*n3 * sin(3*delta_phi) * cos(3*(phi + phi0));
+
+    M = b * F0 * (Ma - Mb + Mc - Md);
+end
