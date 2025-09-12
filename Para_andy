@@ -1,0 +1,98 @@
+clear; clc;
+
+%% PARAMETERS
+M = 16;              % Number of elements in circular array
+R = 0.5;             % Radius of array in wavelengths
+T = 200;             % Number of time steps
+K = 3;               % Number of sources
+SNR_dB = 10;         % Signal-to-noise ratio
+lambda = 1;          % Wavelength
+f = 1;               % Frequency (normalized)
+fs = 1;              % Sampling frequency
+t_vec = (0:T-1)/fs;
+
+% Source angles [azimuth (theta), elevation (phi)] in degrees
+DoAs = [30, 90; 60, 90; 120, 90];  % [az, el] for each source
+
+%% ARRAY GEOMETRY
+theta_elements = linspace(0, 2*pi, M + 1); theta_elements(end) = [];
+array_pos = R * [cos(theta_elements); sin(theta_elements)];  % [2 x M]
+
+%% SOURCE SIGNALS
+s = (randn(K, T) + 1j*randn(K, T)) / sqrt(2);  % QPSK-like baseband signals
+
+% Steering matrix A [M x K]
+A = zeros(M, K);
+for k = 1:K
+    az = deg2rad(DoAs(k, 1));
+    el = deg2rad(DoAs(k, 2));
+    k_vec = (2*pi/lambda) * [cos(az)*sin(el); sin(az)*sin(el)];  % wavevector
+    A(:, k) = exp(1j * (array_pos' * k_vec));  % steering vector
+end
+
+%% RECEIVE SIGNALS + NOISE
+X = A * s;  % clean signal at array
+signal_power = mean(abs(X(:)).^2);
+noise_power = signal_power / (10^(SNR_dB / 10));
+noise = sqrt(noise_power/2) * (randn(M, T) + 1j*randn(M, T));
+X_noisy = X + noise;
+
+%% FORM 3D TENSOR: [M x M x T]
+tensor = zeros(M, M, T);
+for t = 1:T
+    x_t = X_noisy(:, t);
+    R_t = x_t * x_t';  % instantaneous covariance (not averaged)
+    tensor(:, :, t) = R_t;
+end
+
+%% BASIC PARAFAC VIA ALS (Rank K)
+% We model: tensor(i,j,t) ≈ sum_r A1(i,r) * A2(j,r) * A3(t,r)
+max_iter = 100;
+A1 = randn(M, K) + 1j*randn(M, K);
+A2 = randn(M, K) + 1j*randn(M, K);
+A3 = randn(T, K) + 1j*randn(T, K);
+
+for iter = 1:max_iter
+    % Update A1
+    for m = 1:M
+        RHS = zeros(K, K);
+        LHS = zeros(K, 1);
+        for t = 1:T
+            X_t = tensor(:, :, t);
+            RHS = RHS + (A3(t,:)' * A3(t,:)) .* (A2' * A2);
+            LHS = LHS + (A2' * X_t(m,:).') .* A3(t,:).';
+        end
+        A1(m, :) = (RHS \ LHS).';
+    end
+
+    % Update A2
+    for m = 1:M
+        RHS = zeros(K, K);
+        LHS = zeros(K, 1);
+        for t = 1:T
+            X_t = tensor(:, :, t);
+            RHS = RHS + (A3(t,:)' * A3(t,:)) .* (A1' * A1);
+            LHS = LHS + (A1' * X_t(:,m)) .* A3(t,:).';
+        end
+        A2(m, :) = (RHS \ LHS).';
+    end
+
+    % Update A3
+    for t = 1:T
+        X_t = tensor(:, :, t);
+        RHS = (A2' * A2) .* (A1' * A1);
+        LHS = zeros(K, 1);
+        for r = 1:K
+            LHS(r) = A1(:, r)' * X_t * A2(:, r);
+        end
+        A3(t, :) = (RHS \ LHS).';
+    end
+end
+
+%% Inspect Result
+disp('Recovered spatial signatures (up to scaling/rotation):');
+for k = 1:K
+    figure;
+    polarplot(angle(A1(:,k))); title(['Spatial mode A1(:,', num2str(k), ')']);
+end
+
