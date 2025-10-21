@@ -1,0 +1,256 @@
+%% parafac_vs_music_circular_array_2D.m
+% UCA narrowband far-field simulation
+% DOA estimation via MUSIC (2D az/el scan) and PARAFAC (CP decomposition),
+% with 2D az-el grid matching for both.
+clear; clc; close all;
+
+%% ===================== USER SETTINGS =====================
+fc       = 3.5e9;          % Carrier [Hz]
+c        = 3e8;            % Speed of light [m/s]
+lambda   = c/fc;
+
+M        = 16;             % Sensors in UCA
+radius   = 0.5*lambda;     % Array radius
+
+K        = 3;                                % # of sources
+az_deg   = [-20,  15,  60];                  % True azimuths [deg], 0 = +x, CCW toward +y
+el_deg   = [ 10,   0, -10];                  % True elevations [deg], 0 = array plane (xy), + up
+
+Nsnap    = 6000;           % Total snapshots
+blockLen = 200;            % Snapshots per covariance slice (PARAFAC diversity)
+SNR_dB   = [10, 5, 0];     % Per-source SNR at a sensor (noise var = 1)
+
+source_type = 'qpsk';      % 'qpsk' or 'tone'
+tone_offsets_Hz = [2e3,4e3,7e3];   % if 'tone'
+fs       = 50e3;           % baseband rate for tones
+
+rng(7);                    % reproducibility
+
+% ---------- 2D scan grids (fine grids = slower) ----------
+AZ_grid_deg = -90:0.5:90;        % azimuth scan grid
+EL_grid_deg = -30:0.5:30;        % elevation scan grid (planar UCA has limited elev observability)
+
+% PARAFAC (CP-ALS) options
+cp_maxit   = 200;
+cp_tol     = 1e-6;
+cp_verbose = true;
+% ===========================================================
+
+%% ======== Geometry, steering, and data generation =========
+k0  = 2*pi/lambda;
+az  = deg2rad(az_deg(:).');      % 1xK
+el  = deg2rad(el_deg(:).');      % 1xK
+
+m = (0:M-1).';
+phi_m = 2*pi*m/M;                                 % element angles
+r_m = [radius*cos(phi_m), radius*sin(phi_m), zeros(M,1)];  % Mx3 positions
+
+Atrue = zeros(M,K);
+for k = 1:K
+    u = [cos(el(k))*cos(az(k)); cos(el(k))*sin(az(k)); sin(el(k))];
+    Atrue(:,k) = exp(1j * k0 * (r_m * u));
+end
+
+% Source matrix S (K x Nsnap)
+switch lower(source_type)
+    case 'qpsk'
+        S = (sign(randn(K,Nsnap)) + 1j*sign(randn(K,Nsnap))) / sqrt(2);
+    case 'tone'
+        t = (0:Nsnap-1)/fs;
+        if numel(tone_offsets_Hz) ~= K, error('tone_offsets_Hz length must be K'); end
+        S = zeros(K, Nsnap);
+        for k = 1:K, S(k,:) = exp(1j*2*pi*tone_offsets_Hz(k)*t); end
+    otherwise
+        error('Unknown source_type');
+end
+SNR_lin = 10.^(SNR_dB(:).'/10);
+S = diag(sqrt(SNR_lin)) * S;                        % scale sources for desired SNR
+
+N = (randn(M,Nsnap) + 1j*randn(M,Nsnap))/sqrt(2);   % noise var=1
+X = Atrue*S + N;                                    % M x Nsnap
+
+%% ======== Sample covariances over short-time blocks ========
+B = floor(Nsnap / blockLen);        % number of blocks
+R = zeros(M,M,B);
+for b = 1:B
+    idx = ( (b-1)*blockLen + 1 ) : ( b*blockLen );
+    Xb = X(:, idx);
+    R(:,:,b) = (Xb*Xb')/blockLen;
+end
+
+%% ================= MUSIC (reference) ======================
+Rfull = (X*X')/Nsnap;
+[Ev,D] = eig((Rfull+Rfull')/2);
+[evals,idx] = sort(real(diag(D)),'descend');
+Ev = Ev(:,idx);
+En = Ev(:,K+1:end);
+
+% Build steering dictionary over 2D grid for efficiency
+[AZm, ELm] = meshgrid(AZ_grid_deg, EL_grid_deg);   % EL rows x AZ cols
+Na = numel(AZ_grid_deg); Ne = numel(EL_grid_deg);
+Agrid = zeros(M, Na*Ne);
+for ii = 1:Ne
+    for jj = 1:Na
+        a = steering_vec_circular(k0, r_m, deg2rad(AZm(ii,jj)), deg2rad(ELm(ii,jj)));
+        Agrid(:, (ii-1)*Na + jj) = a / norm(a);
+    end
+end
+
+% MUSIC pseudospectrum over 2D (EL x AZ)
+Pmu = zeros(Ne, Na);
+for ii = 1:Ne
+    for jj = 1:Na
+        a = Agrid(:, (ii-1)*Na + jj);
+        Pmu(ii,jj) = 1 / max( norm(En' * a)^2, 1e-12 );
+    end
+end
+Pmu_dB = 10*log10(Pmu / max(Pmu,[],'all'));
+
+% Pick top-K peaks on the 2D surface with simple non-maximum suppression
+est_music = pick_topk_2d(Pmu, AZ_grid_deg, EL_grid_deg, K);
+
+%% ================= PARAFAC (CP-ALS) =======================
+Xten = R;                % size M x M x B
+Ravg = mean(R,3);
+[U0,~,~] = svd((Ravg+Ravg')/2,'econ');
+A = U0(:,1:K);           % init mode-1
+Bf = conj(A);            % tie mode-2 by Hermitian coupling
+C = randn(B,K)+1j*randn(B,K);
+
+fit_prev = 0;
+for it = 1:cp_maxit
+    % Update A
+    Z = khatri_rao(C, Bf);                 % (B*M) x K
+    X1 = reshape(Xten, M, []);             % M x (M*B)
+    A = X1 / (Z.');
+    % Update B, tie to conj(A)
+    Z = khatri_rao(C, A);
+    X2 = reshape(permute(Xten,[2 1 3]), M, []);  % M x (M*B)
+    Bf = X2 / (Z.');
+    % Phase align columns, then tie
+    for k = 1:K
+        ph = angle( sum( conj(Bf(:,k)).*A(:,k) ) );
+        Bf(:,k) = exp(1j*ph) * Bf(:,k);
+    end
+    Bf = conj(A);
+    % Update C
+    Z = khatri_rao(Bf, A);                 % (M*M) x K
+    X3 = reshape(permute(Xten,[3 1 2]), B, []); % B x (M*M)
+    C = X3 / (Z.');
+    % Normalize
+    [A,Bf,C] = normalize_columns_abc(A,Bf,C);
+    % Fit
+    num=0; den=0;
+    for b = 1:B
+        Xhat = A * diag(C(b,:)) * Bf';
+        num = num + norm(Xten(:,:,b) - Xhat,'fro')^2;
+        den = den + norm(Xten(:,:,b),'fro')^2;
+    end
+    fit = 1 - num/max(den,eps);
+    if cp_verbose && (mod(it,10)==0 || it==1)
+        fprintf('CP-ALS iter %3d, fit = %.6f\n', it, fit);
+    end
+    if abs(fit - fit_prev) < cp_tol, break; end
+    fit_prev = fit;
+end
+
+% 2D grid matching for each column of A (PARAFAC)
+% Pre-compute responses onto the same dictionary Agrid
+% Correlation map for column k: reshape(abs(Agrid' * a_k), [Na, Ne])'
+est_parafac = struct('az',[],'el',[]);
+for k = 1:K
+    ak = A(:,k) / norm(A(:,k));
+    corr = abs(Agrid' * ak);                % (Na*Ne) x 1
+    corrMap = reshape(corr, [Na, Ne]).';    % EL x AZ
+    pk = pick_topk_2d(corrMap, AZ_grid_deg, EL_grid_deg, 1);
+    est_parafac(k).az = pk.az(1);
+    est_parafac(k).el = pk.el(1);
+end
+
+%% ================= Results & visualization =================
+true_sorted = sortrows([az_deg(:), el_deg(:)], [1 2]);
+music_sorted = sortrows([est_music.az(:), est_music.el(:)], [1 2]);
+parafac_coords = [[est_parafac.az].', [est_parafac.el].'];
+parafac_sorted = sortrows(parafac_coords, [1 2]);
+
+fprintf('\n=== RESULTS (Az, El in deg) ===\n');
+fprintf('True:      %s\n', mat2str(true_sorted));
+fprintf('MUSIC:     %s\n', mat2str(music_sorted));
+fprintf('PARAFAC:   %s\n', mat2str(parafac_sorted));
+
+% MUSIC heatmap
+figure('Name','MUSIC 2D Az–El Pseudospectrum');
+imagesc(AZ_grid_deg, EL_grid_deg, Pmu_dB);
+axis xy; colorbar; xlabel('Azimuth [deg]'); ylabel('Elevation [deg]');
+title('MUSIC pseudospectrum [dB]');
+hold on;
+plot(az_deg, el_deg, 'wx', 'MarkerSize',10,'LineWidth',2);       % true
+plot(music_sorted(:,1), music_sorted(:,2), 'wo', 'MarkerSize',8,'LineWidth',1.5); % music est
+plot(parafac_sorted(:,1), parafac_sorted(:,2), 'w+', 'MarkerSize',10,'LineWidth',1.5); % parafac est
+legend('True','MUSIC est','PARAFAC est','Location','southoutside');
+
+% (Optional) PARAFAC correlation maps per source
+%{
+for k = 1:K
+    ak = A(:,k) / norm(A(:,k));
+    corr = abs(Agrid' * ak);
+    corrMap = reshape(corr, [Na, Ne]).';
+    figure('Name',sprintf('PARAFAC factor %d correlation'),k);
+    imagesc(AZ_grid_deg, EL_grid_deg, corrMap);
+    axis xy; colorbar; xlabel('Az [deg]'); ylabel('El [deg]');
+    title(sprintf('PARAFAC column %d correlation map',k));
+    hold on; plot(parafac_sorted(k,1), parafac_sorted(k,2), 'wo', 'MarkerSize',8,'LineWidth',1.5);
+end
+%}
+
+%% ================= Helper functions =======================
+function a = steering_vec_circular(k0, r_m, az, el)
+% Steering vector for UCA in xy-plane.
+% az: 0 along +x, CCW toward +y. el: 0 in plane, + upward.
+    u = [cos(el)*cos(az); cos(el)*sin(az); sin(el)];
+    a = exp(1j * k0 * (r_m * u));
+end
+
+function Z = khatri_rao(A,B)
+% Column-wise Kronecker (Khatri-Rao) product, size: (size(A,1)*size(B,1)) x K
+    [IA,K] = size(A); [IB,KB] = size(B);
+    if KB~=K, error('KR: column mismatch'); end
+    Z = zeros(IA*IB,K);
+    for k=1:K
+        Z(:,k) = kron(A(:,k), B(:,k));
+    end
+end
+
+function [A,B,C] = normalize_columns_abc(A,B,C)
+% Normalize columns of A and B; absorb magnitudes into C
+    K = size(A,2);
+    for k=1:K
+        na = norm(A(:,k)); if na==0, na=1; end
+        nb = norm(B(:,k)); if nb==0, nb=1; end
+        s = sqrt(na*nb);
+        A(:,k) = A(:,k)/s;
+        B(:,k) = B(:,k)/s;
+        C(:,k) = C(:,k)*(s^2);
+    end
+end
+
+function est = pick_topk_2d(map, az_grid_deg, el_grid_deg, K)
+% Find K separated peaks on a 2D map; returns struct with est.az, est.el
+% Simple greedy non-maximum suppression with a small neighborhood.
+    map2 = map;
+    est.az = zeros(1,K); est.el = zeros(1,K);
+    % Neighborhood half-widths (indices) for suppression (tune as needed)
+    nbh_az = max(1, round(2 / mean(diff(az_grid_deg))));
+    nbh_el = max(1, round(2 / mean(diff(el_grid_deg))));
+    for k = 1:K
+        [val, idx] = max(map2(:)); %#ok<ASGLU>
+        if ~isfinite(val) || val<=0, est.az = est.az(1:k-1); est.el = est.el(1:k-1); break; end
+        [ii, jj] = ind2sub(size(map2), idx);  % (el, az)
+        est.az(k) = az_grid_deg(jj);
+        est.el(k) = el_grid_deg(ii);
+        % suppress neighborhood
+        i1 = max(1, ii-nbh_el); i2 = min(size(map2,1), ii+nbh_el);
+        j1 = max(1, jj-nbh_az); j2 = min(size(map2,2), jj+nbh_az);
+        map2(i1:i2, j1:j2) = -Inf;
+    end
+end
