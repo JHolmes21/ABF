@@ -1,0 +1,298 @@
+%% parafac_vs_music_disk_array.m
+% Filled circular (disk) planar array (z=0) with ~lambda/2 spacing (hex packing).
+% MUSIC (2D az/el) vs PARAFAC (CP) on covariance slices with power diversity.
+% NOTE: Planar array -> inherent elevation ambiguity (±θ). Optional tilt pattern can help.
+clear; clc; close all;
+
+%% ===================== USER SETTINGS =====================
+fc = 3.5e9; c = 3e8; lambda = c/fc;
+radius_aperture = 1.0*lambda;      % disk radius
+dmin = 0.50*lambda;                 % target min inter-element spacing (~λ/2)
+M_target = 64;                      % approximate number of sensors (hex fill picks <= this)
+use_tilt_pattern = false;           % <<< set true to add per-element elevation gain diversity
+
+K = 3;                              % number of sources
+az_deg = [-20, 15, 60];             % true azimuths (deg)
+el_deg = [ 10,  0,-10];             % true elevations (deg)
+
+Nsnap = 8000;                       % total snapshots
+blockLen = 256; overlap = 0.5;      % block settings for slices
+SNR_dB = [10, 5, 0];                % per-source per-sensor SNR
+source_type = 'qpsk'; fs = 50e3; tone_offsets_Hz = [2e3,4e3,7e3];
+
+% MUSIC scan grids (coarse -> fine)
+AZ_coarse = -90:1.0:90; EL_coarse = -30:1.0:30;
+AZ_fine   = -1.5:0.1:1.5; EL_fine  = -1.0:0.1:1.0;
+
+% PARAFAC options
+powerdiv_sigma = 0.6;               % blockwise power diversity (log-normal stdev)
+cp_maxit = 300; cp_tol = 1e-6; cp_verbose = true;
+gamma_damp = 0.9;                   % ALS damping
+mask_diagonal = true;
+subtract_noise_floor = true;
+
+rng(7);
+%% ==========================================================
+
+%% ======== Disk array geometry (hex packing with ~dmin) =========
+k0 = 2*pi/lambda;
+
+% Hex grid step sizes
+dx = dmin;                 % horizontal step
+dy = dmin*sqrt(3)/2;       % vertical step (hex)
+% Grid extents to cover the disk
+xv = -radius_aperture:dx:radius_aperture;
+yv = -radius_aperture:dy:radius_aperture;
+
+xy = [];
+for iy = 1:numel(yv)
+    y = yv(iy);
+    % stagger every other row by dx/2
+    xoff = (mod(iy,2)==0) * (dx/2);
+    xs = xv + xoff;
+    for ix = 1:numel(xs)
+        x = xs(ix);
+        if x^2 + y^2 <= radius_aperture^2 + 1e-12
+            xy = [xy; x, y]; %#ok<AGROW>
+        end
+    end
+end
+
+% If too many points, downsample to ~M_target while preserving min spacing
+if size(xy,1) > M_target
+    % simple farthest-point thinning
+    keep = false(size(xy,1),1);
+    idx = randi(size(xy,1)); keep(idx)=true;
+    while sum(keep) < M_target
+        kept = xy(keep,:);
+        d2 = pdist2(xy, kept).^2;
+        [~, idx] = max(min(d2,[],2)); % farthest from current kept set
+        keep(idx)=true;
+    end
+    xy = xy(keep,:);
+end
+
+M = size(xy,1);
+r_m = [xy, zeros(M,1)];    % planar disk, z=0
+
+% Optional per-element tilt pattern to break elevation ambiguity (no 2nd ring)
+alpha = 15;                            % tilt magnitude (deg)
+tilt_deg = repmat([+alpha; -alpha], ceil(M/2), 1); tilt_deg = tilt_deg(1:M);
+pat_p = 3;                             % element pattern sharpness
+elem_gain = @(el) max(cosd(el - tilt_deg), 0).^pat_p; % Mx1 gain vs elevation
+
+% Steering function (choose isotropic or tilted)
+a_iso   = @(az,el) exp(1j*k0*( r_m * [cosd(el)*cosd(az); cosd(el)*sind(az); sind(el)] ));
+a_tilt  = @(az,el) elem_gain(el) .* a_iso(az,el);
+a_fun   = @(az,el) (use_tilt_pattern ? a_tilt(az,el) : a_iso(az,el));
+
+% Build true steering matrix
+Atrue = zeros(M,K);
+for k=1:K
+    Atrue(:,k) = a_fun(az_deg(k), el_deg(k));
+end
+
+%% ======== Simulate source signals and snapshots =========================
+switch lower(source_type)
+  case 'qpsk'
+    S = (sign(randn(K,Nsnap))+1j*sign(randn(K,Nsnap)))/sqrt(2);
+  case 'tone'
+    t=(0:Nsnap-1)/fs; S=zeros(K,Nsnap);
+    for k=1:K, S(k,:)=exp(1j*2*pi*tone_offsets_Hz(k)*t); end
+  otherwise, error('unknown source_type');
+end
+S = diag( sqrt(10.^(SNR_dB(:).'/10)) ) * S;
+
+N = (randn(M,Nsnap)+1j*randn(M,Nsnap))/sqrt(2);
+X_all = Atrue*S + N;
+
+%% ======== Overlapped covariance slices with power diversity =============
+hop = max(1, round(blockLen*(1-overlap)));
+starts = 1:hop:(Nsnap-blockLen+1);
+B = numel(starts);
+
+G = exp(powerdiv_sigma*randn(K,B));   % >0 per (source,block)
+G = G ./ mean(G,2);                   % normalize per source
+
+R = zeros(M,M,B);
+w = hann(blockLen).'; wn = w/sqrt(mean(w.^2));
+for b=1:B
+    idx = starts(b)+(0:blockLen-1);
+    S_block = S(:,idx) .* sqrt(G(:,b));
+    Xb = Atrue*S_block + (randn(M,blockLen)+1j*randn(M,blockLen))/sqrt(2);
+    Xb = Xb .* wn;                    % taper
+    R(:,:,b) = (Xb*Xb')/blockLen;
+end
+
+% Preprocess slices
+Rproc = R;
+if subtract_noise_floor
+  for b=1:B
+    ev = sort(real(eig((R(:,:,b)+R(:,:,b)')/2)),'ascend');
+    sig2 = median(ev(max(1,M-3):M));
+    Rproc(:,:,b) = R(:,:,b) - sig2*eye(M);
+  end
+end
+if mask_diagonal
+  for b=1:B, Rproc(1:M+1:end,b) = 0; end
+end
+
+%% ================= MUSIC (reference) ===================================
+Rfull = (X_all*X_all')/Nsnap;
+[Ev,D]=eig((Rfull+Rfull')/2);
+[~,ix] = sort(real(diag(D)),'descend'); Ev=Ev(:,ix); En=Ev(:,K+1:end);
+
+dict = @(az,el) a_fun(az,el) / max(norm(a_fun(az,el)),eps);
+
+% coarse map
+[AZm,ELm]=meshgrid(AZ_coarse,EL_coarse);
+Na=numel(AZ_coarse); Ne=numel(EL_coarse);
+Pcoarse = zeros(Ne,Na);
+for ii=1:Ne, for jj=1:Na
+    a = dict(AZm(ii,jj),ELm(ii,jj));
+    Pcoarse(ii,jj) = 1 / max(norm(En'*a)^2,1e-12);
+end, end
+est_music = pick_topk_2d(Pcoarse, AZ_coarse, EL_coarse, K);
+
+% fine refinement near each peak
+for k=1:numel(est_music.az)
+    azc=est_music.az(k); elc=est_music.el(k);
+    az_loc = azc + AZ_fine; el_loc = elc + EL_fine;
+    Pf = zeros(numel(el_loc), numel(az_loc));
+    for ii=1:numel(el_loc), for jj=1:numel(az_loc)
+        Pf(ii,jj) = 1/max(norm(En'*dict(az_loc(jj), el_loc(ii)))^2,1e-12);
+    end, end
+    pk = pick_topk_2d(Pf, az_loc, el_loc, 1);
+    est_music.az(k)=pk.az(1); est_music.el(k)=pk.el(1);
+end
+
+%% ================= PARAFAC (CP-ALS) ====================================
+Xten = Rproc;  % M x M x B
+
+% Seed A via SVD of average slice and dictionary correlation
+Ravg = mean(Rproc,3);
+[U0,~,~]=svd((Ravg+Ravg')/2,'econ');
+AZi=-90:2:90; ELi=-30:2:30;
+Agrid = zeros(M, numel(AZi)*numel(ELi)); idx=1;
+for ee=1:numel(ELi), for aa=1:numel(AZi)
+    Agrid(:,idx) = dict(AZi(aa), ELi(ee)); idx=idx+1;
+end, end
+scores = abs(Agrid'*(U0(:,1:K))); [~,imax]=maxk(sum(scores,2), K);
+A = phase_anchor(Agrid(:,imax));  Bf = conj(A);  C = max(real(randn(B,K)),0);
+
+fit_prev=0;
+for it=1:cp_maxit
+    % --- A update (ridge LS) ---
+    Z = khatri_rao(C, Bf);
+    X1 = reshape(Xten, M, []);
+    A_ls = ridge_ls(X1, Z, 1e-3);
+    A = (1-gamma_damp)*A + gamma_damp*A_ls;
+    A = phase_anchor(A);
+    % --- B update (tie to conj(A)) ---
+    Z = khatri_rao(C, A);
+    X2 = reshape(permute(Xten,[2 1 3]), M, []);
+    B_ls = ridge_ls(X2, Z, 1e-3);
+    for kcol=1:K
+        ph = angle(sum(conj(B_ls(:,kcol)).*A(:,kcol)));
+        B_ls(:,kcol) = exp(1j*ph)*B_ls(:,kcol);
+    end
+    Bf = conj(A);
+    % --- C update (NN) ---
+    Z = khatri_rao(Bf, A);
+    X3 = reshape(permute(Xten,[3 1 2]), B, []);
+    C_ls = ridge_ls(X3, Z, 2e-3);
+    C = (1-gamma_damp)*C + gamma_damp*C_ls;
+    C = max(real(C), 0);
+    % --- Normalize & masked fit ---
+    [A,Bf,C] = normalize_columns_abc(A,Bf,C);
+    num=0; den=0;
+    for b=1:B
+        Xhat = A*diag(C(b,:))*Bf';
+        if mask_diagonal
+            Xb = Xten(:,:,b); Xb(1:M+1:end)=0; Xhat(1:M+1:end)=0;
+        else
+            Xb = Xten(:,:,b);
+        end
+        num = num + norm(Xb - Xhat,'fro')^2;
+        den = den + norm(Xb,'fro')^2;
+    end
+    fit = 1 - num/max(den,eps);
+    if cp_verbose && (mod(it,10)==0 || it==1), fprintf('CP iter %3d, fit=%.6f\n', it, fit); end
+    if abs(fit-fit_prev)<cp_tol, break; end
+    fit_prev=fit;
+end
+
+% rank(C) diagnostic
+fprintf('rank(C) ~ %d, cond(C) ~ %.1f\n', rank(C), cond(C));
+
+%% ======== 2D grid matching for PARAFAC columns =========================
+est_par = struct('az',[],'el',[]);
+for k=1:K
+    ak = A(:,k)/max(norm(A(:,k)),eps);
+    % coarse search
+    best = [-Inf, NaN, NaN];
+    for ee=1:numel(EL_coarse), for aa=1:numel(AZ_coarse)
+        val = abs( ak' * dict(AZ_coarse(aa), EL_coarse(ee)) );
+        if val>best(1), best=[val, AZ_coarse(aa), EL_coarse(ee)]; end
+    end, end
+    % fine
+    az_loc = best(2) + AZ_fine; el_loc = best(3) + EL_fine;
+    best2 = best;
+    for ee=1:numel(el_loc), for aa=1:numel(az_loc)
+        val = abs( ak' * dict(az_loc(aa), el_loc(ee)) );
+        if val>best2(1), best2=[val, az_loc(aa), el_loc(ee)]; end
+    end, end
+    est_par.az(k)=best2(2); est_par.el(k)=best2(3);
+end
+
+%% ================= Results & quick plots ===============================
+true_sorted    = sortrows([az_deg(:), el_deg(:)], [1 2]);
+music_sorted   = sortrows([est_music.az(:), est_music.el(:)], [1 2]);
+parafac_sorted = sortrows([[est_par.az].', [est_par.el].'], [1 2]);
+
+fprintf('\n=== RESULTS (Az, El in deg) ===\n');
+fprintf('True:      %s\n', mat2str(true_sorted));
+fprintf('MUSIC:     %s\n', mat2str(music_sorted));
+fprintf('PARAFAC:   %s\n', mat2str(parafac_sorted));
+
+Pcoarse_dB = 10*log10(Pcoarse / max(Pcoarse,[],'all'));
+figure('Name','MUSIC 2D Coarse Pseudospectrum'); imagesc(AZ_coarse, EL_coarse, Pcoarse_dB);
+axis xy; colorbar; xlabel('Az [deg]'); ylabel('El [deg]'); title('MUSIC (coarse) [dB]');
+hold on; plot(az_deg,el_deg,'wx','MarkerSize',10,'LineWidth',2);
+plot(music_sorted(:,1),music_sorted(:,2),'wo','MarkerSize',8,'LineWidth',1.5);
+plot(parafac_sorted(:,1),parafac_sorted(:,2),'w+','MarkerSize',10,'LineWidth',1.5);
+legend('True','MUSIC est','PARAFAC est','Location','southoutside');
+
+%% ================= Helper functions ====================================
+function Xridge = ridge_ls(Y, Z, eps_scale)
+    G = Z' * Z; mu = eps_scale * trace(G)/size(G,1);
+    Xridge = (Y * Z) / (G + mu*eye(size(G)));
+end
+function v = normalize_col(v), v = v / max(norm(v),eps); end
+function A = phase_anchor(A)
+  for k=1:size(A,2), ph = angle(A(1,k)); A(:,k) = A(:,k)*exp(-1j*ph); end
+end
+function Z = khatri_rao(A,B)
+  [IA,K]=size(A); [IB,KB]=size(B); if KB~=K, error('KR col mismatch'); end
+  Z=zeros(IA*IB,K); for k=1:K, Z(:,k)=kron(A(:,k),B(:,k)); end
+end
+function [A,B,C]=normalize_columns_abc(A,B,C)
+  K=size(A,2);
+  for k=1:K
+    na=norm(A(:,k)); nb=norm(B(:,k)); if na==0, na=1; end; if nb==0, nb=1; end
+    s=sqrt(na*nb); A(:,k)=A(:,k)/s; B(:,k)=B(:,k)/s; C(:,k)=C(:,k)*(s^2);
+  end
+end
+function est = pick_topk_2d(map, az_grid_deg, el_grid_deg, K)
+  map2=map; est.az=zeros(1,K); est.el=zeros(1,K);
+  nbh_az=max(1,round(2/mean(diff(az_grid_deg))));
+  nbh_el=max(1,round(2/mean(diff(el_grid_deg))));
+  for k=1:K
+    [val,idx]=max(map2(:)); if ~isfinite(val)||val<=0, est.az=est.az(1:k-1); est.el=est.el(1:k-1); break; end
+    [ii,jj]=ind2sub(size(map2),idx);
+    est.az(k)=az_grid_deg(jj); est.el(k)=el_grid_deg(ii);
+    i1=max(1,ii-nbh_el); i2=min(size(map2,1),ii+nbh_el);
+    j1=max(1,jj-nbh_az); j2=min(size(map2,2),jj+nbh_az);
+    map2(i1:i2,j1:j2)=-Inf;
+  end
+end
