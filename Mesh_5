@@ -1,0 +1,15 @@
+%% === Mesh plot of PARAFAC spatial signatures (A) ===
+% A : M x K  (M = elements/channels, K = components)
+
+[M, K] = size(A);
+Z = abs(A);  % magnitude; use real(A) if you want real part
+
+figure('Name','Spatial signatures (|A|)','Color','w');
+[t, kgrid] = meshgrid(1:K, 1:M);
+mesh(t, kgrid, Z, 'EdgeColor','interp', 'FaceColor','none');
+xlabel('Component index k');
+ylabel('Element index m');
+zlabel('|A(m,k)|');
+title('PARAFAC spatial signatures (magnitude)');
+colormap(jet); colorbar;
+view(45,30); grid on; box on;
