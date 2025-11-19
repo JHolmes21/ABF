@@ -1,0 +1,57 @@
+%% === Spatial meshes of PARAFAC components over array layout ===
+% Uses element positions from elt(:,1:3) and plots |A(:,k)| spatially.
+% One coloured mesh per component, all on the same axes.
+
+% Inputs assumed in workspace:
+%   elt : n x 5  -> [x y z weight spare]
+%   A   : n x K  -> PARAFAC spatial signatures (columns = components)
+
+% --- Extract positions and values ---
+x = elt(:,1); y = elt(:,2);   % spatial layout (project to x–y)
+[M, K] = size(A);
+
+% Safety checks
+if M ~= numel(x)
+    error('A has %d rows but elt has %d elements.', M, numel(x));
+end
+
+% --- Build a common XY grid covering the aperture ---
+pad  = 0.05 * max(range(x), range(y));    % small padding around aperture
+xg   = linspace(min(x)-pad, max(x)+pad, 80);
+yg   = linspace(min(y)-pad, max(y)+pad, 80);
+[Xg,Yg] = meshgrid(xg, yg);
+
+% --- Plot settings ---
+colors = lines(K);        % distinct colours for each component
+alpha_val = 0.55;         % transparency so meshes can be seen together
+use_z_offset = false;     % set true to separate meshes vertically
+z_offset_step = 0.15 * max(abs(A(:)));  % vertical spacing if enabled
+
+figure('Name','Spatial meshes of A (one mesh per component)','Color','w'); hold on;
+
+for k = 1:K
+    V   = abs(A(:,k));   % or real(A(:,k)) if you prefer phase-sensitive view
+    F   = scatteredInterpolant(x, y, V, 'natural', 'none');   % interpolate over aperture
+    Zg  = F(Xg, Yg);
+
+    % Optional z-offset per component to avoid overlap
+    if use_z_offset
+        Zplot = Zg + (k-1)*z_offset_step;
+    else
+        Zplot = Zg;
+    end
+
+    h = mesh(Xg, Yg, Zplot, ...
+        'FaceColor', 'none', ...      % mesh (no filled faces)
+        'EdgeColor', colors(k,:), ...
+        'LineWidth', 1.0);
+    h.EdgeAlpha = alpha_val;
+
+    % Also plot element samples as coloured markers for reference
+    plot3(x, y, V + (use_z_offset*(k-1)*z_offset_step), '.', 'Color', colors(k,:), 'MarkerSize', 10);
+end
+
+xlabel('x (m)'); ylabel('y (m)'); zlabel('|A(m,k)|');
+title('PARAFAC spatial signatures over array (one mesh per component)');
+grid on; box on; view(45,30);
+legend(arrayfun(@(k) sprintf('Comp %d',k), 1:K, 'UniformOutput', false), 'Location','bestoutside');
