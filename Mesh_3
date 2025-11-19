@@ -1,0 +1,104 @@
+%% === 1) Demix to get separated signals (no ground-truth needed) ===
+AhA = A' * A;
+mu  = 1e-3 * trace(AhA)/max(K,1);        % small ridge for stability
+W   = (AhA + mu*eye(K)) \ (A');          % K×m demixer
+S_hat = W * X_all;                        % K×Nsnap estimated components
+
+%% === 2) Plot all separated signals on one axis (choose what to plot) ===
+t = 1:size(S_hat,2);
+colors = lines(K);
+
+% Option A: magnitudes (robust for QPSK/tones)
+figure('Name','Separated signals (magnitude)','Color','w'); hold on;
+for k = 1:K
+    plot(t, abs(S_hat(k,:)), 'Color', colors(k,:), 'LineWidth', 1.2);
+end
+xlabel('Snapshot index n'); ylabel('|Ŝ_k[n]|'); grid on; box on;
+title('All separated components (magnitude)'); 
+legend(arrayfun(@(k) sprintf('Comp %d',k), 1:K, 'UniformOutput', false), 'Location','best');
+
+% Option B: real parts (uncomment if preferred)
+% figure('Name','Separated signals (real part)','Color','w'); hold on;
+% for k = 1:K
+%     plot(t, real(S_hat(k,:)), 'Color', colors(k,:), 'LineWidth', 1.2);
+% end
+% xlabel('Snapshot index n'); ylabel('Re\{Ŝ_k[n]\}'); grid on; box on;
+% title('All separated components (real part)');
+% legend(arrayfun(@(k) sprintf('Comp %d',k), 1:K, 'UniformOutput', false), 'Location','best');
+
+%% === 3) Optional comparison to true sources, if available ===
+% If you *do* have simulated sources in your script under some name,
+% this will find them; otherwise it silently skips this section.
+if exist('Ssig','var')==1
+    S_true = Ssig;          % your earlier naming
+elseif exist('S','var')==1
+    S_true = S;             % some scripts use S
+end
+
+if exist('S_true','var')==1 && size(S_true,2)==size(S_hat,2)
+    % Match est components to true sources (perm + complex scale)
+    num = S_true * S_hat';                          % K×K
+    den = (vecnorm(S_true,2,2)) * (vecnorm(S_hat,2,2)).';
+    Gamma = abs(num) ./ max(den, eps);              % similarity
+
+    % greedy assignment (toolbox-free)
+    Kt = size(S_true,1); Ke = size(S_hat,1);
+    unmatched_true = true(1,Kt); unmatched_hat = true(1,Ke);
+    map_true = zeros(1,min(Kt,Ke)); map_hat = map_true;
+    G = Gamma;
+    for r = 1:min(Kt,Ke)
+        G(~unmatched_true,:) = -Inf;
+        G(:,~unmatched_hat) = -Inf;
+        [val,idx] = max(G(:)); %#ok<ASGLU>
+        if ~isfinite(val), break; end
+        [iq,ik] = ind2sub(size(G),idx);
+        map_true(r)=iq; map_hat(r)=ik;
+        unmatched_true(iq)=false; unmatched_hat(ik)=false;
+    end
+    valid = map_true>0 & map_hat>0;
+    map_true = map_true(valid); map_hat = map_hat(valid);
+
+    % align scale/phase and compute metrics
+    S_hat_aligned = zeros(size(S_hat));
+    fprintf('\n=== Separation quality (matched pairs) ===\n');
+    for ii = 1:numel(map_true)
+        q = map_true(ii); k = map_hat(ii);
+        alpha = (S_true(q,:) * S_hat(k,:)') / (norm(S_hat(k,:))^2 + eps);
+        S_hat_aligned(q,:) = alpha * S_hat(k,:);
+        err = S_true(q,:) - S_hat_aligned(q,:);
+        corr_qk = abs( (S_true(q,:) * S_hat_aligned(q,:)') / (norm(S_true(q,:))*norm(S_hat_aligned(q,:)) + eps) );
+        nmse_qk = norm(err)^2 / (norm(S_true(q,:))^2 + eps);
+        snr_qk  = 10*log10( 1 / max(nmse_qk, eps) );
+        fprintf('True %d  <--  Est %d : corr=%.3f, NMSE=%.3e, SNR=%.2f dB\n', q, k, corr_qk, nmse_qk, snr_qk);
+    end
+
+    % overlay plots (magnitude)
+    figure('Name','Separated vs True (magnitude)','Color','w'); hold on;
+    for q = 1:size(S_true,1)
+        if any(S_hat_aligned(q,:))
+            plot(t, abs(S_hat_aligned(q,:)), '-', 'Color', colors(q,:), 'LineWidth', 1.4);
+        end
+        plot(t, abs(S_true(q,:)), '--', 'Color', colors(q,:), 'LineWidth', 1.0);
+    end
+    xlabel('Snapshot index n'); ylabel('|·|'); grid on; box on;
+    title('Separated components (solid) vs True sources (dashed)');
+    legendStrings = [arrayfun(@(q) sprintf('Est %d',q), 1:size(S_true,1), 'UniformOutput', false), ...
+                     arrayfun(@(q) sprintf('True %d',q), 1:size(S_true,1), 'UniformOutput', false)];
+    legend(legendStrings, 'Location','bestoutside');
+end
+
+%% === 4) No ground truth? Compare block powers to C (sanity check) ===
+if exist('starts','var')==1 && exist('blockLen','var')==1
+    B = size(C,1);
+    blk_pow = zeros(B,K);
+    for b = 1:B
+        idx = starts(b)+(0:blockLen-1);
+        idx = idx(idx<=size(S_hat,2));  % safety
+        blk_pow(b,:) = mean(abs(S_hat(:,idx)).^2, 2).';
+    end
+    figure('Name','Per-block power: Ŝ vs C','Color','w');
+    subplot(1,2,1); mesh(1:K, 1:B, blk_pow); view(45,30);
+    xlabel('Component k'); ylabel('Block b'); zlabel('Power'); title('From Ŝ');
+    subplot(1,2,2); mesh(1:K, 1:B, max(real(C),0)); view(45,30);
+    xlabel('Component k'); ylabel('Block b'); zlabel('Power'); title('PARAFAC C');
+end
