@@ -1,0 +1,21 @@
+%% === Mesh plot of all separated signals on one surface ===
+% S_hat : K x Nsnap  (K components, Nsnap time samples)
+
+K = size(S_hat,1);
+Nsnap = size(S_hat,2);
+
+% Choose what to plot: magnitude or real part
+Z = abs(S_hat);     % magnitude
+% Z = real(S_hat);  % or uncomment to plot real parts instead
+
+% Build axes
+[t, kgrid] = meshgrid(1:Nsnap, 1:K);
+
+figure('Name','Separated signals (mesh)','Color','w');
+mesh(t, kgrid, Z, 'EdgeColor','interp', 'FaceColor','none');  % smooth colour mesh
+xlabel('Snapshot index n');
+ylabel('Component index k');
+zlabel('|Ŝ_k[n]|');
+title('All separated signals (magnitude)');
+colormap(jet); colorbar;
+view(45,30); grid on; box on;
